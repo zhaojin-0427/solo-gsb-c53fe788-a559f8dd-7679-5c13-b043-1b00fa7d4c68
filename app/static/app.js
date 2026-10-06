@@ -6,9 +6,12 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const state = {
   project: null,
-  deliveryVerify: null,  // 当前展示的核验结果（绑定 project_id + timeline_hash）
-  verifySeq: 0,          // 单调递增的上传序号：使迟到的旧响应失效
-  verifyNotice: "",      // 无结果时核验区显示的提示（已作废 / 重新核验中）
+  deliveryVerify: null,      // 当前展示的核验结果（绑定 project_id + timeline_hash）
+  deliverySnapshot: null,    // 最近一次“已提交”稿件在提交瞬间读取到的快照
+  verifyUploadSeq: 0,        // 提交序号：每次点击上传并核验递增，自动重核不递增
+  verifyRequestSeq: 0,       // 请求序号：每次核验请求递增，用于丢弃同稿迟到响应
+  verifyInflightSeq: null,   // 当前在途的读稿/核验请求序号；防止变轴时并发重核
+  verifyNotice: "",          // 无结果时核验区显示的提示（已作废 / 重新核验中）
 };
 
 const VERIFY_LABEL = {
@@ -129,28 +132,90 @@ function renderGapReview(p) {
 }
 
 // ---------- 交付字幕核验 ----------
-// 核验结论与「项目 + 生效时间轴 + 上传先后」绑定：
-// - 服务端在项目详情与核验响应中返回同一 timeline_hash（生效轴指纹）；
-//   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废、不得继续显示；
-//   已选稿仍在文件输入中时自动用同一稿件按新生效轴重新核验，否则提示重传。
-//   生效轴未变（如仅调 CPS 上限、相同参数重提）或修改失败时，结论保留。
+// 核验结论与「项目 + 生效时间轴 + 已提交稿件 + 上传序号」绑定：
+// - “上传并核验”的提交动作才是稿件切换边界。提交时立即把文件内容读入
+//   deliverySnapshot；此后自动重核只使用这份快照。仅在文件框改选乙而未提交，
+//   不会影响甲；即使清空文件框，甲的快照仍可读取，也继续用甲自动重核。
+// - 服务端在项目详情与核验响应中返回同一 timeline_hash（生效轴指纹）。
+//   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废；快照仍可读时
+//   自动按新轴重新核验，快照不可读时提示重传。生效轴未变（如仅调 CPS、
+//   相同参数重提）或修改失败时，结论保留。
 // - 响应指纹与本页详情不符时，本页详情可能已过期（另一标签页改轴）：
 //   先拉取该项目最新详情再裁决——响应指纹与最新详情一致，说明已返回的
 //   结论按新详情仍然有效，直接接纳并同步页面；仍不一致（等待期间生效轴
-//   再次变化）才用仍可读取的已选稿按新轴重核。自动重核链有终止条件
-//   （VERIFY_MAX_AUTO_ATTEMPTS）：详情刷新失败、已选稿不可用或达到上限
+//   再次变化）才用最近一次已提交快照按新轴重核。自动重核链有终止条件
+//   （VERIFY_MAX_AUTO_ATTEMPTS）：详情刷新失败、快照不可用或达到上限
 //   时立即停止并提示重新上传——不显示旧结论，也不无界发请求。
-// - 每次上传取递增序号 verifySeq；响应或详情到达时若已有更新的上传、或
-//   已切换项目（project_id 不符），迟到结果直接丢弃——只呈现当前项目
-//   最近一次有效上传的结果。
+// - verifyUploadSeq 标识最近一次提交动作；verifyRequestSeq 标识每一次
+//   核验请求。迟到响应必须同时属于当前项目、当前提交和当前在途请求才可
+//   落地：未提交的改选稿不能取代旧稿，旧项目或旧提交的迟到响应也会丢弃。
 const VERIFY_MAX_AUTO_ATTEMPTS = 3;  // 一条自动重核链最多发起的核验请求数
 
 function resetDeliveryVerify() {
   state.deliveryVerify = null;
+  state.deliverySnapshot = null;
   state.verifyNotice = "";
-  state.verifySeq++;                 // 使在途的旧响应全部失效
+  state.verifyInflightSeq = null;
+  state.verifyUploadSeq++;             // 使在途的旧提交/旧详情全部失效
+  state.verifyRequestSeq++;
   const f = $("#deliveryVerifyForm");
   if (f) f.reset();
+}
+
+function isReadableDeliverySnapshot(snapshot) {
+  if (!snapshot) return false;
+  if (typeof snapshot.bytes === "string") return snapshot.bytes.length > 0;
+  return !!snapshot.bytes && Number(snapshot.size) > 0;
+}
+
+async function readDeliveryFile(file) {
+  const buffer = await file.arrayBuffer();
+  // 复制一份 ArrayBuffer，避免底层 File/Blob 生命周期变化后快照不可读。
+  const copy = buffer.slice(0);
+  const bytes = typeof Blob === "function" ? new Blob([copy]) : copy;
+  return {name: file.name || "", bytes, size: copy.byteLength};
+}
+
+function verifyStale(uploadSeq, requestSeq, pid) {
+  return uploadSeq !== state.verifyUploadSeq ||
+         state.verifyInflightSeq !== requestSeq ||
+         !state.project || state.project.id !== pid;
+}
+
+function invalidateDeliveryVerify(message) {
+  state.verifyInflightSeq = null;
+  state.deliverySnapshot = null;
+  state.deliveryVerify = null;
+  state.verifyNotice = message;
+  renderDeliveryVerify();
+}
+
+function failSubmittedDeliveryVerify(fallback, message) {
+  state.verifyInflightSeq = null;
+  const current = state.project;
+  const oldResult = fallback?.result;
+  const oldSnapshot = fallback?.snapshot;
+  if (oldResult && current && oldResult.project_id === current.id &&
+      oldResult.timeline_hash === current.timeline_hash) {
+    // 新稿提交后读取/服务端解析失败：它不能取代上一份仍对当前生效轴
+    // 有效的结论；后续自动重核继续沿用上一份快照。
+    state.deliverySnapshot = oldSnapshot;
+    state.deliveryVerify = oldResult;
+    state.verifyNotice = "";
+    renderDeliveryVerify();
+    return;
+  }
+  if (isReadableDeliverySnapshot(oldSnapshot)) {
+    // 提交失败时生效轴也已变化：新稿没有成为已提交稿，回到上一份成功
+    // 提交的甲稿并按当前轴重核。
+    state.deliverySnapshot = oldSnapshot;
+    state.deliveryVerify = null;
+    state.verifyNotice = "新提交稿未能核验，正在用最近一次已提交稿重新核验…";
+    renderDeliveryVerify();
+    runDeliveryVerify(oldSnapshot);
+    return;
+  }
+  invalidateDeliveryVerify(message);
 }
 
 function syncDeliveryVerify() {
@@ -166,16 +231,22 @@ function syncDeliveryVerify() {
   if (v.timeline_hash === p.timeline_hash) return;   // 生效轴未变：保留
   // 生效轴已变化：旧结论立即作废，不再显示
   state.deliveryVerify = null;
-  const file = $("#deliveryVerifyForm").delivery.files[0];
-  if (file) {
-    state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
-    runDeliveryVerify(file, true);
+  if (state.verifyInflightSeq !== null) {
+    // 当前提交/重核仍在途：让该请求按指纹裁决，不得另发一条重核请求。
+    state.verifyNotice = "生效时间轴已变化，正在等待当前已提交稿件的核验结果…";
+    return;
+  }
+  const snapshot = state.deliverySnapshot;
+  if (isReadableDeliverySnapshot(snapshot)) {
+    state.verifyNotice = "生效时间轴已变化，正在用最近一次已提交稿重新核验…";
+    runDeliveryVerify(snapshot);
   } else {
     state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
   }
 }
 
-function acceptDeliveryVerify(result) {
+function acceptDeliveryVerify(result, requestSeq) {
+  if (state.verifyInflightSeq === requestSeq) state.verifyInflightSeq = null;
   state.verifyNotice = "";
   state.deliveryVerify = result;
   renderDeliveryVerify();
@@ -184,33 +255,62 @@ function acceptDeliveryVerify(result) {
         `缺失 ${s.missing} · 新增 ${s.new} · 待确认 ${s.pending}`);
 }
 
-async function runDeliveryVerify(file, auto, attempt = 0) {
+async function submitDeliveryVerify(file) {
   const p = state.project;
   if (!p || !file) return;
-  const seq = ++state.verifySeq;
+  const uploadSeq = ++state.verifyUploadSeq;
+  const readRequestSeq = ++state.verifyRequestSeq;
+  const fallback = {result: state.deliveryVerify,
+                    snapshot: state.deliverySnapshot};
+  state.verifyInflightSeq = readRequestSeq;
+  state.deliveryVerify = null;
+  state.verifyNotice = `正在核验「${file.name || "交付稿"}」…`;
+  renderDeliveryVerify();
+
+  let snapshot;
+  try {
+    snapshot = await readDeliveryFile(file);
+  } catch (e) {
+    if (verifyStale(uploadSeq, readRequestSeq, p.id)) return;
+    failSubmittedDeliveryVerify(
+      fallback, `无法读取回传稿：${e.message}，请重新上传。`);
+    toast(e.message, true);
+    return;
+  }
+  if (verifyStale(uploadSeq, readRequestSeq, p.id)) return;
+  state.deliverySnapshot = snapshot;  // 成功读取后，乙才真正成为最近提交稿
+  await runDeliveryVerify(snapshot, 0, uploadSeq, fallback);
+}
+
+async function runDeliveryVerify(snapshot, attempt = 0,
+                                 uploadSeq = state.verifyUploadSeq,
+                                 fallback = null) {
+  const p = state.project;
+  if (!p || !isReadableDeliverySnapshot(snapshot)) return;
+  const requestSeq = ++state.verifyRequestSeq;
+  state.verifyInflightSeq = requestSeq;
   const fd = new FormData();
-  fd.append("delivery", file);
+  fd.append("delivery", snapshot.bytes, snapshot.name);
   try {
     const result = await api(`/api/projects/${p.id}/verify-delivery`,
                              { method: "POST", body: fd });
-    // 绑定校验：只呈现当前项目最近一次有效上传的结果
-    if (seq !== state.verifySeq) return;                     // 已有更新的上传
-    if (!state.project || state.project.id !== p.id) return; // 已切换项目
-    if (result.project_id !== p.id) return;                  // 防御
+    if (verifyStale(uploadSeq, requestSeq, p.id)) return;
+    if (result.project_id !== p.id) return;               // 防御
     if (result.timeline_hash === state.project.timeline_hash) {
-      acceptDeliveryVerify(result);        // 指纹相符：结论对当前生效轴有效
+      acceptDeliveryVerify(result, requestSeq);          // 指纹相符：结论有效
       return;
     }
     // 指纹不符：本页详情可能已过期（另一标签页改轴），先取最新详情再裁决
-    await reconcileDeliveryVerify(result, seq, attempt);
+    await reconcileDeliveryVerify(result, snapshot, uploadSeq, requestSeq,
+                                  attempt);
   } catch (e) {
-    if (seq !== state.verifySeq) return;
-    if (!state.project || state.project.id !== p.id) return;
-    if (auto) {
-      // 自动重核失败：作废旧结论，要求人工重传
-      state.deliveryVerify = null;
-      state.verifyNotice = `自动重新核验失败：${e.message}，请重新上传回传稿。`;
-      renderDeliveryVerify();
+    if (verifyStale(uploadSeq, requestSeq, p.id)) return;
+    if (fallback) {
+      failSubmittedDeliveryVerify(
+        fallback, `提交稿件核验失败：${e.message}，请重新上传回传稿。`);
+    } else {
+      invalidateDeliveryVerify(
+        `自动重新核验失败：${e.message}，请重新上传回传稿。`);
     }
     toast(e.message, true);
   }
@@ -219,51 +319,47 @@ async function runDeliveryVerify(file, auto, attempt = 0) {
 // 核验响应指纹与本页详情不符：本页详情可能已过期（另一标签页改参数/采纳），
 // 先拉取该项目最新详情再裁决——
 // - 响应指纹与最新详情一致：已返回的结论按新详情仍然有效，接纳并同步页面；
-// - 仍不一致：生效轴在等待期间再次变化，用仍可读取的已选稿按新轴重核。
+// - 仍不一致：生效轴在等待期间再次变化，用最近一次已提交快照按新轴重核。
 // 终止条件：自动重核链达到 VERIFY_MAX_AUTO_ATTEMPTS 次、详情刷新失败或
-// 已选稿不可用时立即停止，作废旧结论并提示重新上传，不无界发请求。
-async function reconcileDeliveryVerify(result, seq, attempt) {
+// 快照不可用时立即停止，作废旧结论并提示重新上传，不无界发请求。
+async function reconcileDeliveryVerify(result, snapshot, uploadSeq,
+                                       requestSeq, attempt) {
   const pid = result.project_id;
   let fresh;
   try {
     fresh = await api(`/api/projects/${pid}`);
   } catch (e) {
-    if (seq !== state.verifySeq) return;
-    if (!state.project || state.project.id !== pid) return;
-    // 详情刷新失败：无法裁决结论是否还有效，作废旧结论并停止
-    state.deliveryVerify = null;
-    state.verifyNotice =
-      `项目详情刷新失败：${e.message}，核验结论已作废，请重新上传回传稿。`;
-    renderDeliveryVerify();
+    if (verifyStale(uploadSeq, requestSeq, pid)) return;
+    invalidateDeliveryVerify(
+      `项目详情刷新失败：${e.message}，核验结论已作废，请重新上传回传稿。`);
     toast(e.message, true);
     return;
   }
-  if (seq !== state.verifySeq) return;                     // 已有更新的上传
-  if (!state.project || state.project.id !== pid) return;  // 已切换项目
+  if (verifyStale(uploadSeq, requestSeq, pid)) return;
   state.project = fresh;          // 页面详情同步到最新（另一标签页的改动）
   if (result.timeline_hash === fresh.timeline_hash) {
-    acceptDeliveryVerify(result);   // 结论按新详情可接纳：无需重核
+    acceptDeliveryVerify(result, requestSeq);   // 结论按新详情可接纳
     render();
     loadProjects();
     return;
   }
   // 生效轴在等待期间又变化：已返回的结论不可接纳，需按最新生效轴重核
   state.deliveryVerify = null;
-  const file = $("#deliveryVerifyForm").delivery.files[0];
-  if (!file) {
-    state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
+  if (!isReadableDeliverySnapshot(snapshot)) {
+    invalidateDeliveryVerify(
+      "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。");
     render();
     return;
   }
   if (attempt + 1 >= VERIFY_MAX_AUTO_ATTEMPTS) {
-    state.verifyNotice =
-      "生效时间轴多次变化，自动重新核验已停止，请重新上传回传稿。";
+    invalidateDeliveryVerify(
+      "生效时间轴多次变化，自动重新核验已停止，请重新上传回传稿。");
     render();
     return;
   }
-  state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
+  state.verifyNotice = "生效时间轴已变化，正在用最近一次已提交稿重新核验…";
   render();
-  await runDeliveryVerify(file, true, attempt + 1);
+  await runDeliveryVerify(snapshot, attempt + 1, uploadSeq);
 }
 
 function renderDeliveryVerify() {
@@ -587,8 +683,8 @@ $("#deliveryVerifyForm").addEventListener("submit", async (ev) => {
   if (!state.project) return;
   const file = ev.target.delivery.files[0];
   if (!file) return;
-  state.verifyNotice = "";
-  await runDeliveryVerify(file, false);
+  // 文件框改选本身不切换稿件；只有提交并成功读取后才保存为稿件快照。
+  await submitDeliveryVerify(file);
 });
 
 $("#deleteProjectBtn").addEventListener("click", async () => {  if (!state.project) return;
