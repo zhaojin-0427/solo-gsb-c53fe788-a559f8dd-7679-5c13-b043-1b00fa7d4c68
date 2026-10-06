@@ -1,15 +1,21 @@
 // 交付字幕核验的前端绑定回归（node 直接运行，无框架）：
 // 用最小 DOM/fetch 桩在 vm 中加载 app/static/app.js，验证——
-// - 核验结果与「项目 + 生效轴 timeline_hash + 上传序号」绑定；
+// - 稿件切换以「提交动作」为唯一边界：提交甲稿后只在文件框改选乙稿而不提交，
+//   本页改参数变轴或跨标签页变轴后刷新详情仍需重核时，自动重核必须读取
+//   最近一次已提交的甲稿快照，绝不读取文件框当前的乙稿；乙稿只有提交后才
+//   取代甲稿；迟到响应不得覆盖更新的提交或新项目；
+// - 清空文件框但甲稿快照仍可读时，自动重核继续用甲稿；
+// - 稿件快照不可读、详情刷新失败或有界重核失败时作废旧结论并提示重传；
+// - 核验结果与「项目 + 生效轴 timeline_hash + 提交序号」绑定；
 // - 参数重算/采纳/撤销改变生效轴（hash 变化）后：旧结论立即作废，
-//   已选稿仍在时自动用同一稿件按新生效轴重新核验，否则提示重新上传；
+//   用已提交稿件快照按新生效轴重新核验，无快照时提示重新上传；
 // - 生效轴未变（hash 相同）时结论保留，不发多余请求；
 // - 跨标签页改轴（本页详情过期）：响应指纹不符时先拉取最新项目详情——
 //   结论按新详情有效则直接接纳（不再重核、不循环请求），仍不符才用
-//   仍可读取的已选稿按新轴重核；自动重核有终止条件，详情刷新失败 /
-//   已选稿不可用 / 达到上限时停止并提示重新上传，不显示旧结论；
-// - 再次上传、详情刷新或切换项目交错时，迟到的响应被丢弃，只呈现当前
-//   项目最近一次有效上传的结果；响应到达即过期（等待期间生效轴被改）
+//   已提交稿件快照按新轴重核；自动重核有终止条件，详情刷新失败 /
+//   快照不可用 / 达到上限时停止并提示重新上传，不显示旧结论；
+// - 再次提交、详情刷新或切换项目交错时，迟到的响应被丢弃，只呈现当前
+//   项目最近一次有效提交的结果；响应到达即过期（等待期间生效轴被改）
 //   时不展示。
 "use strict";
 const assert = require("assert");
@@ -55,7 +61,7 @@ const documentStub = {
 const pending = [];   // 在途请求 {url, opts, resolve}
 const fetchLog = [];
 function fetchStub(url, opts = {}) {
-  fetchLog.push({ url, method: opts.method || "GET" });
+  fetchLog.push({ url, method: opts.method || "GET", opts });
   return new Promise((resolve) => pending.push({ url, opts, resolve }));
 }
 function popPending(substr) {
@@ -83,7 +89,8 @@ class FormDataStub {
 // ---------- 在 vm 中加载 app.js，并暴露词法绑定的 state 与函数 ----------
 const src = fs.readFileSync(APP_JS, "utf8") +
   "\n;globalThis.__app = { state, render, renderDeliveryVerify," +
-  " syncDeliveryVerify, resetDeliveryVerify, runDeliveryVerify };";
+  " syncDeliveryVerify, resetDeliveryVerify, runDeliveryVerify," +
+  " submittedVerifyFile, scheduleAutoDeliveryVerify };";
 const sandbox = {
   document: documentStub,
   fetch: fetchStub,
@@ -135,6 +142,31 @@ settingsForm.tolerance_ms = makeEl("input");
 function clearVerifyState() {
   state.deliveryVerify = null;
   state.verifyNotice = "";
+  state.verifySnapshot = null;
+  state.verifyAutoInFlight = false;
+  state.verifySeq++;
+}
+
+// 模拟提交动作（点击「上传并核验」）：提交是稿件切换边界——只有这里会
+// 写入已提交稿件快照。runDeliveryVerify 本身不改快照，与生产代码一致。
+function submitDelivery(file) {
+  state.verifySnapshot = { file, name: String(file), projectId: state.project.id };
+  state.verifyAutoInFlight = false;
+  state.verifyNotice = "";
+  return app.runDeliveryVerify(file, false);
+}
+
+// 取最近一次核验请求实际携带的文件（FormData 的 delivery 部分），
+// 用于断言自动重核用的是哪一份稿。
+function lastPostedFile() {
+  for (let i = fetchLog.length - 1; i >= 0; i--) {
+    const r = fetchLog[i];
+    if (r.url.includes("/verify-delivery") && r.opts && r.opts.body) {
+      const part = r.opts.body.parts.find(([k]) => k === "delivery");
+      return part ? part[1] : null;
+    }
+  }
+  return null;
 }
 
 // ---------- 场景 ----------
@@ -143,24 +175,28 @@ async function test_manual_upload_binds_result() {
   clearVerifyState();
   state.project = proj(1, "h1");
   deliveryForm.delivery.files = ["fileA"];
-  const p = app.runDeliveryVerify("fileA", false);
+  const p = submitDelivery("fileA");
   assert.strictEqual(verifyPostCount(), 1, "应发出一次核验请求");
   respondJson(popPending("verify-delivery"), verifyResult(1, "h1", 2));
   await p; await flush();
   assert.ok(state.deliveryVerify, "结果应展示");
   assert.strictEqual(state.deliveryVerify.timeline_hash, "h1");
   assert.strictEqual(state.deliveryVerify.project_id, 1);
+  assert.strictEqual(app.submittedVerifyFile(), "fileA",
+                     "提交后应记住已提交稿件快照");
   console.log("frontend manual upload binds project+timeline ok");
 }
 
 async function test_timeline_change_auto_reverify() {
   // 参数重算改变生效轴（h1 → h2）：旧结论立即作废，
-  // 已选稿仍在 → 自动用同一稿件按新生效轴重新核验
+  // 自动用最近一次已提交的稿件按新生效轴重新核验
   state.project = proj(1, "h2");
   app.render();
   assert.strictEqual(state.deliveryVerify, null, "旧结论必须立即作废");
   assert.ok(state.verifyNotice.includes("重新核验"), "应提示正在重核");
   assert.strictEqual(verifyPostCount(), 2, "应自动发起重新核验");
+  assert.strictEqual(lastPostedFile(), "fileA",
+                     "自动重核必须使用已提交稿件快照");
   respondJson(popPending("verify-delivery"), verifyResult(1, "h2", 1));
   await flush();
   assert.ok(state.deliveryVerify, "自动重核结果应展示");
@@ -181,30 +217,33 @@ async function test_timeline_unchanged_keeps_result() {
 }
 
 async function test_concurrent_uploads_last_wins() {
-  // 连续两次上传：第一次的响应迟到，不得覆盖第二次的结果
+  // 连续两次提交：第一次的响应迟到，不得覆盖第二次提交的结果
   clearVerifyState();
   state.project = proj(1, "h2");
   deliveryForm.delivery.files = ["fileB"];
-  const p1 = app.runDeliveryVerify("fileB", false);
+  const p1 = submitDelivery("fileB");
   const req1 = popPending("verify-delivery");
-  const p2 = app.runDeliveryVerify("fileB2", false);
+  deliveryForm.delivery.files = ["fileB2"];
+  const p2 = submitDelivery("fileB2");
   const req2 = popPending("verify-delivery");
   respondJson(req2, verifyResult(1, "h2", 5));   // 第二次先返回
   await p2; await flush();
   assert.strictEqual(state.deliveryVerify.summary.pass, 5);
+  assert.strictEqual(app.submittedVerifyFile(), "fileB2",
+                     "快照应为最近一次提交的稿件");
   respondJson(req1, verifyResult(1, "h2", 99));  // 第一次迟到
   await p1; await flush();
   assert.strictEqual(state.deliveryVerify.summary.pass, 5,
-                     "迟到响应不得覆盖最近一次上传的结果");
+                     "迟到响应不得覆盖最近一次提交的结果");
   console.log("frontend concurrent uploads: last response wins ok");
 }
 
 async function test_switch_project_discards_inflight() {
-  // 上传未完成时切换项目：迟到响应不得落到新项目
+  // 提交未完成时切换项目：迟到响应不得落到新项目
   clearVerifyState();
   state.project = proj(1, "h2");
   deliveryForm.delivery.files = ["fileC"];
-  const p = app.runDeliveryVerify("fileC", false);
+  const p = submitDelivery("fileC");
   const req = popPending("verify-delivery");
   app.resetDeliveryVerify();          // 切换项目的前置清理（在途失效）
   state.project = proj(2, "k1");
@@ -215,34 +254,112 @@ async function test_switch_project_discards_inflight() {
   console.log("frontend switch project discards in-flight response ok");
 }
 
-async function test_no_file_requires_reupload() {
-  // 先得到项目 2 的有效结果
+async function test_clear_input_keeps_submitted_snapshot() {
+  // 核心回归（改选未提交 / 清空文件框）：提交甲稿后**清空文件框**，
+  // 甲稿快照仍可读取 → 变轴后自动重核继续用甲稿，而不是提示重传。
   clearVerifyState();
   state.project = proj(2, "k1");
-  deliveryForm.delivery.files = ["fileD"];
-  const p = app.runDeliveryVerify("fileD", false);
+  deliveryForm.delivery.files = ["fileA-submitted"];
+  const p = submitDelivery("fileA-submitted");
   respondJson(popPending("verify-delivery"), verifyResult(2, "k1", 3));
   await p; await flush();
   assert.ok(state.deliveryVerify);
-  // 文件输入已清空（用户改选后又取消），生效轴变化 → 作废并提示重传
-  deliveryForm.delivery.files = [];
-  const before = verifyPostCount();
+  deliveryForm.delivery.files = [];          // 用户清空了文件框
+  assert.strictEqual(app.submittedVerifyFile(), "fileA-submitted",
+                     "清空文件框不影响已提交稿件快照");
   state.project = proj(2, "k2");
   app.render();
-  assert.strictEqual(state.deliveryVerify, null, "旧结论必须作废");
-  assert.strictEqual(verifyPostCount(), before, "无已选稿不得自动重核");
+  assert.strictEqual(state.deliveryVerify, null, "旧结论必须立即作废");
+  assert.strictEqual(lastPostedFile(), "fileA-submitted",
+                     "清空文件框后仍须用甲稿快照自动重核");
+  respondJson(popPending("verify-delivery"), verifyResult(2, "k2", 2));
+  await flush();
+  assert.ok(state.deliveryVerify, "甲稿快照的重核结果应展示");
+  assert.strictEqual(state.deliveryVerify.timeline_hash, "k2");
+  console.log("frontend clear input keeps submitted snapshot ok");
+}
+
+async function test_reselect_without_submit_ignored_on_reverify() {
+  // 核心回归（不得把乙的结论当作甲的）：提交甲稿后只在文件框改选乙稿
+  // 而**不提交**，随后本页改参数改变生效轴——自动重核必须携带甲稿，
+  // 不得读取文件框当前的乙稿。
+  clearVerifyState();
+  state.project = proj(3, "m1");
+  deliveryForm.delivery.files = ["manuscript-A"];
+  const p = submitDelivery("manuscript-A");
+  respondJson(popPending("verify-delivery"), verifyResult(3, "m1", 2));
+  await p; await flush();
+  assert.strictEqual(app.submittedVerifyFile(), "manuscript-A");
+  deliveryForm.delivery.files = ["manuscript-B"];  // 只改选，不提交
+  state.project = proj(3, "m2");                   // 本页改参数变轴
+  app.render();
+  assert.strictEqual(state.deliveryVerify, null, "旧结论必须立即作废");
+  assert.strictEqual(lastPostedFile(), "manuscript-A",
+                     "改选未提交的乙稿不得参与自动重核，必须仍用甲稿");
+  assert.ok(state.verifyNotice.includes("重新核验"));
+  // 响应按甲稿在新轴上的结论（与乙稿会给出的结论不同）
+  const r = verifyResult(3, "m2", 0);
+  r.summary = { pass: 0, time_mismatch: 2, missing: 0, new: 0, pending: 0 };
+  respondJson(popPending("verify-delivery"), r);
+  await flush();
+  assert.ok(state.deliveryVerify, "应展示甲稿（而非乙稿）的重核结论");
+  assert.strictEqual(state.deliveryVerify.summary.time_mismatch, 2);
+  assert.strictEqual(app.submittedVerifyFile(), "manuscript-A",
+                     "乙稿未提交，不得取代甲稿快照");
+  console.log("frontend reselect without submit ignored on re-verify ok");
+}
+
+async function test_submit_b_replaces_a_then_reverify_uses_b() {
+  // 接上一情境：乙稿只有在**提交之后**才可取代甲稿——提交乙稿后变轴，
+  // 自动重核必须携带乙稿。
+  state.project = proj(3, "m3");
+  deliveryForm.delivery.files = ["manuscript-B"];  // 此时文件框已是乙稿
+  const p = submitDelivery("manuscript-B");        // 提交：切换边界
+  assert.strictEqual(app.submittedVerifyFile(), "manuscript-B",
+                     "提交后乙稿取代甲稿");
+  respondJson(popPending("verify-delivery"), verifyResult(3, "m3", 2));
+  await p; await flush();
+  state.project = proj(3, "m4");
+  app.render();
+  assert.strictEqual(lastPostedFile(), "manuscript-B",
+                     "提交乙稿后自动重核应使用乙稿");
+  respondJson(popPending("verify-delivery"), verifyResult(3, "m4", 1));
+  await flush();
+  assert.strictEqual(state.deliveryVerify.timeline_hash, "m4");
+  console.log("frontend submit B replaces A; re-verify uses B ok");
+}
+
+async function test_unreadable_snapshot_asks_reupload() {
+  // 已提交稿件快照已不可读（如浏览器回收文件句柄）：自动重核请求无法
+  // 携带该文件而失败 → 作废旧结论并提示重新上传，不回退文件框改选稿。
+  clearVerifyState();
+  state.project = proj(2, "k1");
+  deliveryForm.delivery.files = ["fileGone"];
+  const p = submitDelivery("fileGone");
+  respondJson(popPending("verify-delivery"), verifyResult(2, "k1", 2));
+  await p; await flush();
+  assert.ok(state.deliveryVerify);
+  // 文件框改选了乙稿但未提交；甲稿快照同时已不可读
+  deliveryForm.delivery.files = ["manuscript-B"];
+  state.verifySnapshot.file = { unreadable: true };
+  state.project = proj(2, "k2");
+  app.render();
+  respondJson(popPending("verify-delivery"),
+              { detail: "回传稿无法读取" }, false, 400);
+  await flush();
+  assert.strictEqual(state.deliveryVerify, null, "不可读时不得保留旧结论");
   assert.ok(state.verifyNotice.includes("重新上传"), "应提示重新上传");
-  console.log("frontend no file -> invalidate + ask re-upload ok");
+  console.log("frontend unreadable snapshot -> ask re-upload ok");
 }
 
 async function test_stale_on_arrival_reverified() {
   // 响应等待期间另一标签页改了参数（本地已刷新到 k3）：
   // 按旧轴 k2 算出的结果到达即过期 → 先拉取最新详情（仍为 k3）裁决，
-  // 结论不可接纳 → 自动用已选稿按新轴重核，不展示过期结果
+  // 结论不可接纳 → 自动用已提交稿件快照按新轴重核，不展示过期结果
   clearVerifyState();
   state.project = proj(2, "k2");
   deliveryForm.delivery.files = ["fileE"];
-  const p = app.runDeliveryVerify("fileE", false);
+  const p = submitDelivery("fileE");
   const req = popPending("verify-delivery");
   state.project = proj(2, "k3");      // 生效轴在等待期间变化
   const before = verifyPostCount();
@@ -252,6 +369,8 @@ async function test_stale_on_arrival_reverified() {
   await flush();
   assert.strictEqual(verifyPostCount(), before + 1,
                      "到达即过期应自动按新生效轴重核");
+  assert.strictEqual(lastPostedFile(), "fileE",
+                     "跨标签页变轴后的重核仍须用已提交稿件快照");
   assert.ok(!state.deliveryVerify ||
             state.deliveryVerify.timeline_hash === "k3",
             "过期结果不得展示");
@@ -261,12 +380,34 @@ async function test_stale_on_arrival_reverified() {
   console.log("frontend stale-on-arrival discarded + re-verified ok");
 }
 
+async function test_stale_reverify_ignores_unsubmitted_reselect() {
+  // 跨标签页变轴、详情刷新后仍需重核的路径上，文件框改选了乙稿但未提交：
+  // 重核仍必须携带甲稿快照，绝不能读取文件框当前的乙稿。
+  clearVerifyState();
+  state.project = proj(2, "k2");
+  deliveryForm.delivery.files = ["manuscript-A"];
+  const p = submitDelivery("manuscript-A");
+  const req = popPending("verify-delivery");
+  state.project = proj(2, "k3");                 // 等待期间跨标签页变轴
+  deliveryForm.delivery.files = ["manuscript-B"];  // 同时只改选、不提交
+  respondJson(req, verifyResult(2, "k2", 4));
+  await flush();
+  respondJson(popPendingExact("/api/projects/2"), proj(2, "k4"));  // 又变轴
+  await flush();
+  assert.strictEqual(lastPostedFile(), "manuscript-A",
+                     "裁决后重核必须用已提交的甲稿，而非文件框的乙稿");
+  respondJson(popPending("verify-delivery"), verifyResult(2, "k4", 4));
+  await p; await flush();
+  assert.strictEqual(state.deliveryVerify.timeline_hash, "k4");
+  console.log("frontend stale re-verify ignores unsubmitted reselect ok");
+}
+
 async function test_auto_reverify_failure_asks_reupload() {
   // 自动重核失败（如回传稿解析失败）：作废旧结论，提示人工重传
   clearVerifyState();
   state.project = proj(2, "k3");
   deliveryForm.delivery.files = ["fileF"];
-  const p = app.runDeliveryVerify("fileF", false);
+  const p = submitDelivery("fileF");
   respondJson(popPending("verify-delivery"), verifyResult(2, "k3", 2));
   await p; await flush();
   assert.ok(state.deliveryVerify);
@@ -289,7 +430,7 @@ async function test_cross_tab_change_accepted_after_detail_refresh() {
   state.project = proj(7, "c1");               // 本页详情过期
   deliveryForm.delivery.files = ["fileX"];
   const base = verifyPostCount();
-  const p = app.runDeliveryVerify("fileX", false);
+  const p = submitDelivery("fileX");
   respondJson(popPending("verify-delivery"), verifyResult(7, "c2", 4));
   await flush();
   respondJson(popPendingExact("/api/projects/7"), proj(7, "c2"));  // 最新详情
@@ -312,7 +453,7 @@ async function test_repeated_timeline_changes_stop_reverify() {
   state.project = proj(4, "r1");
   deliveryForm.delivery.files = ["fileR"];
   const base = verifyPostCount();
-  const p = app.runDeliveryVerify("fileR", false);        // 第 1 次核验
+  const p = submitDelivery("fileR");          // 第 1 次核验
   respondJson(popPending("verify-delivery"), verifyResult(4, "r2", 1));
   await flush();
   respondJson(popPendingExact("/api/projects/4"), proj(4, "r3"));
@@ -340,7 +481,7 @@ async function test_detail_refresh_failure_stops() {
   state.project = proj(5, "f1");
   deliveryForm.delivery.files = ["fileF"];
   const base = verifyPostCount();
-  const p = app.runDeliveryVerify("fileF", false);
+  const p = submitDelivery("fileF");
   respondJson(popPending("verify-delivery"), verifyResult(5, "f2", 1));
   await flush();
   respondJson(popPendingExact("/api/projects/5"),
@@ -353,23 +494,25 @@ async function test_detail_refresh_failure_stops() {
   console.log("frontend detail refresh failure -> stop + ask re-upload ok");
 }
 
-async function test_no_file_during_reconcile_stops() {
-  // 等待详情期间已选稿被清空：生效轴仍不符时不得自动重核，提示重传
+async function test_no_snapshot_during_reconcile_stops() {
+  // 等待详情期间项目切换语义下快照被清空（或已无已提交稿）：生效轴仍
+  // 不符时不得自动重核，提示重传。文件框清空本身不清快照——这里直接
+  // 模拟「没有已提交快照」的情形。
   clearVerifyState();
   state.project = proj(6, "n1");
   deliveryForm.delivery.files = ["fileN"];
   const base = verifyPostCount();
-  const p = app.runDeliveryVerify("fileN", false);
+  const p = submitDelivery("fileN");
   respondJson(popPending("verify-delivery"), verifyResult(6, "n2", 1));
   await flush();
-  deliveryForm.delivery.files = [];           // 已选稿不可用
+  state.verifySnapshot = null;               // 已提交稿件不可用（非文件框清空）
   respondJson(popPendingExact("/api/projects/6"), proj(6, "n3"));
   await p; await flush();
   assert.strictEqual(verifyPostCount(), base + 1,
-                     "已选稿不可用不得继续重核");
+                     "无已提交快照不得继续重核");
   assert.strictEqual(state.deliveryVerify, null, "不得显示旧结论");
   assert.ok(state.verifyNotice.includes("重新上传"), "应提示重新上传");
-  console.log("frontend no file during reconcile -> stop + ask re-upload ok");
+  console.log("frontend no snapshot during reconcile -> stop + ask re-upload ok");
 }
 
 async function test_reconcile_discards_after_project_switch() {
@@ -377,7 +520,7 @@ async function test_reconcile_discards_after_project_switch() {
   clearVerifyState();
   state.project = proj(8, "s1");
   deliveryForm.delivery.files = ["fileS"];
-  const p = app.runDeliveryVerify("fileS", false);
+  const p = submitDelivery("fileS");
   respondJson(popPending("verify-delivery"), verifyResult(8, "s2", 1));
   await flush();
   const getReq = popPendingExact("/api/projects/8");
@@ -393,28 +536,29 @@ async function test_reconcile_discards_after_project_switch() {
   console.log("frontend reconcile discarded after project switch ok");
 }
 
-async function test_reconcile_discards_when_newer_upload() {
-  // 详情刷新在途时再次上传：旧链一律丢弃，只呈现最近一次上传的结果
+async function test_reconcile_discards_when_newer_submit() {
+  // 详情刷新在途时再次提交：旧链一律丢弃，只呈现最近一次提交的结果
   clearVerifyState();
   state.project = proj(10, "u1");
   deliveryForm.delivery.files = ["fileU"];
-  const p1 = app.runDeliveryVerify("fileU", false);
+  const p1 = submitDelivery("fileU");
   respondJson(popPending("verify-delivery"), verifyResult(10, "u2", 1));
   await flush();
   const getReq = popPendingExact("/api/projects/10");
-  const p2 = app.runDeliveryVerify("fileU2", false);  // 再次上传（更新序号）
-  respondJson(getReq, proj(10, "u3"));                // 旧链的详情迟到
+  deliveryForm.delivery.files = ["fileU2"];
+  const p2 = submitDelivery("fileU2");        // 再次提交（更新序号 + 换快照）
+  respondJson(getReq, proj(10, "u3"));        // 旧链的详情迟到
   await p1; await flush();
   assert.strictEqual(state.deliveryVerify, null, "旧链不得展示结论");
-  // 第二次上传的响应 u3 与本地 u1 不符 → 再经一次详情同步后接纳
+  // 第二次提交的响应 u3 与本地 u1 不符 → 再经一次详情同步后接纳
   respondJson(popPending("verify-delivery"), verifyResult(10, "u3", 6));
   await flush();
   respondJson(popPendingExact("/api/projects/10"), proj(10, "u3"));
   await p2; await flush();
-  assert.ok(state.deliveryVerify, "最近一次上传的结果应展示");
+  assert.ok(state.deliveryVerify, "最近一次提交的结果应展示");
   assert.strictEqual(state.deliveryVerify.summary.pass, 6);
   assert.strictEqual(state.deliveryVerify.timeline_hash, "u3");
-  console.log("frontend reconcile discarded when newer upload ok");
+  console.log("frontend reconcile discarded when newer submit ok");
 }
 
 async function main() {
@@ -423,15 +567,19 @@ async function main() {
   await test_timeline_unchanged_keeps_result();
   await test_concurrent_uploads_last_wins();
   await test_switch_project_discards_inflight();
-  await test_no_file_requires_reupload();
+  await test_clear_input_keeps_submitted_snapshot();
+  await test_reselect_without_submit_ignored_on_reverify();
+  await test_submit_b_replaces_a_then_reverify_uses_b();
+  await test_unreadable_snapshot_asks_reupload();
   await test_stale_on_arrival_reverified();
+  await test_stale_reverify_ignores_unsubmitted_reselect();
   await test_auto_reverify_failure_asks_reupload();
   await test_cross_tab_change_accepted_after_detail_refresh();
   await test_repeated_timeline_changes_stop_reverify();
   await test_detail_refresh_failure_stops();
-  await test_no_file_during_reconcile_stops();
+  await test_no_snapshot_during_reconcile_stops();
   await test_reconcile_discards_after_project_switch();
-  await test_reconcile_discards_when_newer_upload();
+  await test_reconcile_discards_when_newer_submit();
   console.log("frontend delivery verify binding regression ok");
 }
 

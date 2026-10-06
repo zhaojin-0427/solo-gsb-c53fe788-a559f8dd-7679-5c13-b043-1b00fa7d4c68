@@ -7,8 +7,13 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const state = {
   project: null,
   deliveryVerify: null,  // 当前展示的核验结果（绑定 project_id + timeline_hash）
-  verifySeq: 0,          // 单调递增的上传序号：使迟到的旧响应失效
+  verifySeq: 0,          // 单调递增的提交序号：使迟到的旧响应失效
   verifyNotice: "",      // 无结果时核验区显示的提示（已作废 / 重新核验中）
+  // 稿件快照：只有「上传并核验」提交动作才会更新它。文件框里改选了另一份
+  // 稿子但没点提交时，快照仍是上一份已提交稿；自动重核与跨标签页裁决一律
+  // 读取快照，绝不读取文件框当前值，避免把改选未提交稿的结论当成旧稿的。
+  verifySnapshot: null,  // {file, name, projectId} 最近一次已提交的稿件
+  verifyAutoInFlight: false,  // 同一生效轴上的自动重核是否在途（防重复触发）
 };
 
 const VERIFY_LABEL = {
@@ -129,28 +134,46 @@ function renderGapReview(p) {
 }
 
 // ---------- 交付字幕核验 ----------
-// 核验结论与「项目 + 生效时间轴 + 上传先后」绑定：
+// 核验结论与「项目 + 生效时间轴 + 提交先后」绑定。稿件切换以**提交动作**
+// （点「上传并核验」）为唯一边界：
+// - 文件框里改选了乙稿但没提交，只是改了输入框的值，state.verifySnapshot
+//   仍是最近一次提交的甲稿；随后本页改参数改变生效轴，或跨标签页变轴后
+//   刷新详情仍需重核时，自动重核一律读取甲稿快照，绝不读取文件框当前值，
+//   不会把乙稿的结论当作甲稿的。乙稿只有被提交之后才取代甲稿。
+// - 清空文件框不影响快照：只要甲稿 File 仍可由本页读取，自动重核继续用甲稿；
+//   稿件已不可读（如浏览器回收了句柄）时作废旧结论并提示重新上传。
 // - 服务端在项目详情与核验响应中返回同一 timeline_hash（生效轴指纹）；
-//   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废、不得继续显示；
-//   已选稿仍在文件输入中时自动用同一稿件按新生效轴重新核验，否则提示重传。
-//   生效轴未变（如仅调 CPS 上限、相同参数重提）或修改失败时，结论保留。
+//   参数重算 / 采纳 / 撤销改变了生效轴后，旧结论立即作废、不得继续显示，
+//   用已提交稿件快照按新生效轴自动重新核验。生效轴未变（如仅调 CPS 上限、
+//   相同参数重提）或修改失败时，结论保留。
 // - 响应指纹与本页详情不符时，本页详情可能已过期（另一标签页改轴）：
 //   先拉取该项目最新详情再裁决——响应指纹与最新详情一致，说明已返回的
 //   结论按新详情仍然有效，直接接纳并同步页面；仍不一致（等待期间生效轴
-//   再次变化）才用仍可读取的已选稿按新轴重核。自动重核链有终止条件
-//   （VERIFY_MAX_AUTO_ATTEMPTS）：详情刷新失败、已选稿不可用或达到上限
+//   再次变化）才用已提交稿件快照按新轴重核。自动重核链有终止条件
+//   （VERIFY_MAX_AUTO_ATTEMPTS）：详情刷新失败、快照不可用或达到上限
 //   时立即停止并提示重新上传——不显示旧结论，也不无界发请求。
-// - 每次上传取递增序号 verifySeq；响应或详情到达时若已有更新的上传、或
+// - 每次提交取递增序号 verifySeq；响应或详情到达时若已有更新的提交、或
 //   已切换项目（project_id 不符），迟到结果直接丢弃——只呈现当前项目
-//   最近一次有效上传的结果。
+//   最近一次有效提交的结果。
 const VERIFY_MAX_AUTO_ATTEMPTS = 3;  // 一条自动重核链最多发起的核验请求数
 
 function resetDeliveryVerify() {
   state.deliveryVerify = null;
   state.verifyNotice = "";
+  state.verifySnapshot = null;       // 切换 / 新建 / 删除项目：快照不跨项目
+  state.verifyAutoInFlight = false;
   state.verifySeq++;                 // 使在途的旧响应全部失效
   const f = $("#deliveryVerifyForm");
   if (f) f.reset();
+}
+
+// 自动重核唯一可用的稿件来源：最近一次**已提交**且属于当前项目、且仍可
+// 读取的稿件快照。文件框当前 files[0]（可能是改选后未提交的乙稿）永不参与。
+function submittedVerifyFile() {
+  const p = state.project;
+  const snap = state.verifySnapshot;
+  if (!p || !snap || snap.projectId !== p.id) return null;
+  return snap.file || null;
 }
 
 function syncDeliveryVerify() {
@@ -164,15 +187,26 @@ function syncDeliveryVerify() {
     return;
   }
   if (v.timeline_hash === p.timeline_hash) return;   // 生效轴未变：保留
-  // 生效轴已变化：旧结论立即作废，不再显示
+  // 生效轴已变化：旧结论立即作废，不再显示。自动重核只认最近一次已提交
+  // 的稿件快照——文件框里改选未提交的乙稿不参与。
   state.deliveryVerify = null;
-  const file = $("#deliveryVerifyForm").delivery.files[0];
+  const file = submittedVerifyFile();
   if (file) {
-    state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
-    runDeliveryVerify(file, true);
+    state.verifyNotice = "生效时间轴已变化，正在用最近一次已提交的稿件重新核验…";
+    scheduleAutoDeliveryVerify(file);
   } else {
-    state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
+    state.verifyNotice =
+      "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
   }
+}
+
+// 触发一次自动重核（来自本页变轴或跨标签页裁决）。同一生效轴上已有自动
+// 重核在途时不重复发起；手动提交不受此限制（提交是稿件切换边界，序号更大）。
+function scheduleAutoDeliveryVerify(file) {
+  const p = state.project;
+  if (!p || !file || state.verifyAutoInFlight) return;
+  state.verifyAutoInFlight = true;
+  runDeliveryVerify(file, true).finally(() => { state.verifyAutoInFlight = false; });
 }
 
 function acceptDeliveryVerify(result) {
@@ -193,8 +227,8 @@ async function runDeliveryVerify(file, auto, attempt = 0) {
   try {
     const result = await api(`/api/projects/${p.id}/verify-delivery`,
                              { method: "POST", body: fd });
-    // 绑定校验：只呈现当前项目最近一次有效上传的结果
-    if (seq !== state.verifySeq) return;                     // 已有更新的上传
+    // 绑定校验：只呈现当前项目最近一次有效提交的结果
+    if (seq !== state.verifySeq) return;                     // 已有更新的提交
     if (!state.project || state.project.id !== p.id) return; // 已切换项目
     if (result.project_id !== p.id) return;                  // 防御
     if (result.timeline_hash === state.project.timeline_hash) {
@@ -207,9 +241,10 @@ async function runDeliveryVerify(file, auto, attempt = 0) {
     if (seq !== state.verifySeq) return;
     if (!state.project || state.project.id !== p.id) return;
     if (auto) {
-      // 自动重核失败：作废旧结论，要求人工重传
+      // 自动重核失败（含稿件快照已不可读、有界重核失败、网络错误）：
+      // 作废旧结论，要求人工重传，绝不回退显示旧结论或文件框里的改选稿
       state.deliveryVerify = null;
-      state.verifyNotice = `自动重新核验失败：${e.message}，请重新上传回传稿。`;
+      state.verifyNotice = `自动重新核验失败：${e.message}，旧核验结论已作废，请重新上传回传稿。`;
       renderDeliveryVerify();
     }
     toast(e.message, true);
@@ -219,9 +254,9 @@ async function runDeliveryVerify(file, auto, attempt = 0) {
 // 核验响应指纹与本页详情不符：本页详情可能已过期（另一标签页改参数/采纳），
 // 先拉取该项目最新详情再裁决——
 // - 响应指纹与最新详情一致：已返回的结论按新详情仍然有效，接纳并同步页面；
-// - 仍不一致：生效轴在等待期间再次变化，用仍可读取的已选稿按新轴重核。
+// - 仍不一致：生效轴在等待期间再次变化，用最近一次已提交的稿件快照按新轴重核。
 // 终止条件：自动重核链达到 VERIFY_MAX_AUTO_ATTEMPTS 次、详情刷新失败或
-// 已选稿不可用时立即停止，作废旧结论并提示重新上传，不无界发请求。
+// 已提交快照不可用时立即停止，作废旧结论并提示重新上传，不无界发请求。
 async function reconcileDeliveryVerify(result, seq, attempt) {
   const pid = result.project_id;
   let fresh;
@@ -238,7 +273,7 @@ async function reconcileDeliveryVerify(result, seq, attempt) {
     toast(e.message, true);
     return;
   }
-  if (seq !== state.verifySeq) return;                     // 已有更新的上传
+  if (seq !== state.verifySeq) return;                     // 已有更新的提交
   if (!state.project || state.project.id !== pid) return;  // 已切换项目
   state.project = fresh;          // 页面详情同步到最新（另一标签页的改动）
   if (result.timeline_hash === fresh.timeline_hash) {
@@ -247,9 +282,10 @@ async function reconcileDeliveryVerify(result, seq, attempt) {
     loadProjects();
     return;
   }
-  // 生效轴在等待期间又变化：已返回的结论不可接纳，需按最新生效轴重核
+  // 生效轴在等待期间又变化：已返回的结论不可接纳，需按最新生效轴重核。
+  // 重核稿件只取最近一次已提交快照（文件框改选未提交的乙稿不参与）。
   state.deliveryVerify = null;
-  const file = $("#deliveryVerifyForm").delivery.files[0];
+  const file = submittedVerifyFile();
   if (!file) {
     state.verifyNotice = "生效时间轴已变化，旧核验结论已作废，请重新上传回传稿。";
     render();
@@ -261,7 +297,7 @@ async function reconcileDeliveryVerify(result, seq, attempt) {
     render();
     return;
   }
-  state.verifyNotice = "生效时间轴已变化，正在用已选稿重新核验…";
+  state.verifyNotice = "生效时间轴已变化，正在用最近一次已提交的稿件重新核验…";
   render();
   await runDeliveryVerify(file, true, attempt + 1);
 }
@@ -277,7 +313,8 @@ function renderDeliveryVerify() {
     return;
   }
   $("#deliveryName").textContent =
-    `已核验：${v.delivery_name || "交付稿"}（生效轴 ${v.reference_count} 条 / 交付 ${v.delivered_count} 条 / 同文案配对 ${v.matched_text_count} 对）`;
+    `已核验：${v.delivery_name || (state.verifySnapshot && state.verifySnapshot.name) || "交付稿"}` +
+    `（生效轴 ${v.reference_count} 条 / 交付 ${v.delivered_count} 条 / 同文案配对 ${v.matched_text_count} 对）`;
   const s = v.summary;
   stats.innerHTML = [
     ["通过", s.pass, "good"],
@@ -580,13 +617,23 @@ $("#gapList").addEventListener("click", async (ev) => {
   }
 });
 
-// 交付字幕核验：上传回传稿，服务端保序最优对应后返回逐行结论。
-// 只读核验，失败（空稿/解析失败）仅弹错，不影响当前项目数据。
+// 交付字幕核验：提交回传稿，服务端保序最优对应后返回逐行结论。
+// 提交动作是稿件切换的唯一边界：无论文件框之前改选过什么，只有点下
+// 「上传并核验」才把当前文件记为已提交稿件快照，此后自动重核 / 跨标签页
+// 裁决都以该快照为准（再次提交乙稿后乙稿才取代甲稿）。只读核验，失败
+// （空稿/解析失败）仅弹错，不影响当前项目数据。
 $("#deliveryVerifyForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   if (!state.project) return;
   const file = ev.target.delivery.files[0];
   if (!file) return;
+  // 提交即落快照：后续清空文件框或改选未提交都不会改变自动重核所用稿件
+  state.verifySnapshot = {
+    file,
+    name: file.name || "交付稿",
+    projectId: state.project.id,
+  };
+  state.verifyAutoInFlight = false;
   state.verifyNotice = "";
   await runDeliveryVerify(file, false);
 });
